@@ -1,0 +1,189 @@
+name: build-auto
+on:
+  push:
+    tags:
+      - 'v*'
+    paths:
+    - '.github/workflows/build-auto.yml'
+    - 'build.cmd'
+    - 'build.ps1'
+    - 'build.sh'
+    - 'laf'
+  workflow_dispatch:
+
+jobs:
+  build-auto:
+    runs-on: windows-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0
+    
+    - name: Install Ninja
+      uses: aseprite/get-ninja@main
+    
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+    
+    - name: Create .build directory and set user kind
+      shell: bash
+      run: |
+        # 创建.build目录并设置为user模式（非交互式）
+        mkdir -p .build
+        echo "user" > .build/userkind
+        
+        # 设置builds_dir为当前目录
+        echo "${{ github.workspace }}" > .build/builds_dir
+    
+    - name: Set Skia directory
+      shell: bash
+      run: |
+        # 获取Skia tag
+        skia_tag=$(cat laf/misc/skia-tag.txt)
+        possible_skia_dir_name=skia-$(echo $skia_tag | cut -d "-" -f 1)
+        
+        # 创建Skia目录
+        skia_dir="C:/deps/$possible_skia_dir_name"
+        mkdir -p "$skia_dir"
+        echo "$skia_dir" > .build/main_skia_dir
+        
+        echo "Skia directory set to: $skia_dir"
+        echo "Skia tag: $skia_tag"
+    
+    - name: Download Skia
+      shell: bash
+      run: |
+        skia_dir=$(cat .build/main_skia_dir)
+        skia_tag=$(cat laf/misc/skia-tag.txt)
+        
+        # 获取Skia下载URL
+        skia_url=$(bash laf/misc/skia-url.sh Release)
+        skia_file=$(basename $skia_url)
+        
+        echo "Downloading Skia from: $skia_url"
+        
+        # 下载Skia
+        if [ ! -f "$skia_dir/$skia_file" ]; then
+          curl --ssl-revoke-best-effort -L -o "$skia_dir/$skia_file" "$skia_url"
+        fi
+        
+        # 解压Skia
+        if [ ! -d "$skia_dir/out/Release-x64" ]; then
+          unzip -n -d "$skia_dir" "$skia_dir/$skia_file"
+        fi
+        
+        echo "Skia downloaded and extracted"
+        ls -la "$skia_dir/out/"
+    
+    - name: Configure with CMake
+      shell: bash
+      run: |
+        skia_dir=$(cat .build/main_skia_dir)
+        
+        # 创建build目录
+        mkdir -p build
+        
+        # 运行CMake配置
+        cmake -B build -S . -G Ninja \
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DLAF_BACKEND=skia \
+          -DSKIA_DIR="$skia_dir" \
+          -DSKIA_LIBRARY_DIR="$skia_dir/out/Release-x64" \
+          -DCMAKE_CXX_FLAGS="/EHsc" \
+          -DCMAKE_C_FLAGS="/EHsc"
+    
+    - name: Build Aseprite
+      shell: bash
+      run: |
+        # 构建项目
+        cmake --build build --target aseprite --config RelWithDebInfo
+    
+    - name: List build output
+      shell: bash
+      run: |
+        echo "Build directory contents:"
+        ls -la build/
+        echo ""
+        echo "Build/bin directory contents:"
+        ls -la build/bin/ || echo "build/bin/ not found"
+        echo ""
+        echo "Looking for aseprite executable:"
+        find build -name "aseprite*" -type f || echo "No aseprite executable found"
+    
+    - name: Package build
+      shell: bash
+      run: |
+        # 获取版本号
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION=$(git rev-parse --short HEAD)
+        fi
+        
+        # 创建release目录
+        mkdir -p release
+        
+        # 确定可执行文件的位置
+        if [ -f "build/bin/aseprite.exe" ]; then
+          EXE_PATH="build/bin/aseprite.exe"
+        elif [ -f "build/aseprite.exe" ]; then
+          EXE_PATH="build/aseprite.exe"
+        else
+          echo "Error: Cannot find aseprite.exe"
+          exit 1
+        fi
+        
+        echo "Found executable at: $EXE_PATH"
+        
+        # 创建临时打包目录
+        mkdir -p package
+        
+        # 复制可执行文件
+        cp "$EXE_PATH" package/
+        
+        # 复制data目录（如果存在）
+        if [ -d "build/data" ]; then
+          cp -r build/data package/
+        fi
+        
+        # 复制所有DLL文件
+        find build -name "*.dll" -exec cp {} package/ \;
+        
+        # 打包
+        cd package
+        7z a -tzip "../release/aseprite-windows-${VERSION}.zip" *
+        cd ..
+        
+        echo "Package created:"
+        ls -la release/
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: aseprite-windows-${{ github.sha }}
+        path: release/
+        retention-days: 7
+    
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: release/*.zip
+        name: Aseprite ${{ github.ref_name }}
+        body: |
+          ## Aseprite Windows 自动构建
+            
+          ### 构建信息
+          - 版本: ${{ github.ref_name }}
+          - 提交: ${{ github.sha }}
+            
+          ### 安装说明
+          1. 下载 `aseprite-windows-${{ github.ref_name }}.zip`
+          2. 解压到任意目录
+          3. 运行 `aseprite.exe`
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
