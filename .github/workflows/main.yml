@@ -1,0 +1,138 @@
+name: build-auto
+on:
+  push:
+    paths:
+    - '.github/workflows/build-auto.yml'
+    - 'build.cmd'
+    - 'build.ps1'
+    - 'build.sh'
+    - 'laf'
+    # 当推送版本标签时自动发布
+    tags:
+      - 'v*'
+  # 允许手动触发工作流
+  workflow_dispatch:
+
+jobs:
+  build-auto:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [RelWithDebInfo]
+        # 如果需要也可以包含Debug版本
+        # build_type: [RelWithDebInfo, Debug]
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: 0  # 获取所有标签和历史记录
+    
+    - uses: aseprite/get-ninja@main
+    - uses: ilammy/msvc-dev-cmd@v1
+    
+    - name: Building
+      shell: bash
+      run: |
+        bash build.sh --auto --norun
+    
+    - name: Running CLI Tests
+      shell: bash
+      run: |
+        export ASEPRITE=$PWD/build/bin/aseprite
+        cd tests
+        bash run-tests.sh
+    
+    - name: Get version
+      id: get_version
+      shell: bash
+      run: |
+        # 从git标签获取版本号，如果没有标签则使用commit hash
+        VERSION=$(git describe --tags --always --dirty)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+        # 如果是标签触发，使用标签名作为版本
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          TAG_VERSION=${GITHUB_REF#refs/tags/}
+          echo "TAG_VERSION=$TAG_VERSION" >> $GITHUB_ENV
+        fi
+    
+    - name: Package artifacts
+      shell: bash
+      run: |
+        # 创建发布包目录
+        mkdir -p release
+        
+        # 设置版本号
+        VERSION="${{ steps.get_version.outputs.version }}"
+        
+        # 打包所有构建产物
+        # 包含可执行文件、数据文件和DLL
+        7z a -tzip "release/aseprite-windows-${{ matrix.build_type }}-${VERSION}.zip" \
+          ./build/bin/* \
+          ./build/data/* \
+          ./build/*.exe \
+          ./build/*.dll \
+          -r
+        
+        # 同时打包一个简化版（只有可执行文件和必要数据）
+        7z a -tzip "release/aseprite-windows-${{ matrix.build_type }}-${VERSION}-minimal.zip" \
+          ./build/bin/aseprite.exe \
+          ./build/data/ \
+          ./build/*.dll \
+          -r
+        
+        # 列出打包的文件
+        ls -la release/
+    
+    - name: Upload artifacts to workflow (always)
+      uses: actions/upload-artifact@v4
+      with:
+        name: aseprite-windows-${{ matrix.build_type }}-${{ github.sha }}
+        path: release/
+        retention-days: 7
+    
+    # 只在标签推送或手动触发时创建Release
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        # 如果是标签触发，使用标签名；如果是手动触发，使用日期版本
+        tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('nightly-{0}-{1}', github.run_number, github.sha) }}
+        name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('Nightly Build #{0}', github.run_number) }}
+        body: |
+          ## Aseprite Windows 自动构建版本
+          
+          ### 构建信息
+          - **版本**: ${{ steps.get_version.outputs.version }}
+          - **提交**: ${{ github.sha }}
+          - **分支**: ${{ github.ref_name }}
+          - **构建类型**: ${{ matrix.build_type }}
+          - **触发事件**: ${{ github.event_name }}
+          - **构建时间**: ${{ github.event.repository.updated_at }}
+          
+          ### 包含文件
+          此Release包含两个压缩包：
+          1. **完整版** (`aseprite-windows-${{ matrix.build_type }}-*.zip`) - 包含所有构建输出
+          2. **精简版** (`aseprite-windows-${{ matrix.build_type }}-*-minimal.zip`) - 只包含运行所需的最小文件集
+          
+          ### 安装说明
+          1. 下载对应版本的ZIP文件
+          2. 解压到任意目录
+          3. 运行 `aseprite.exe`
+          
+          ### 系统要求
+          - Windows 10/11 或 Windows Server 2016+
+          - 64位操作系统
+          
+          ### 注意事项
+          - 这是自动构建版本，可能包含未测试的更改
+          - 如遇到问题，请提交 Issue
+        draft: false
+        prerelease: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        files: |
+          release/*.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
